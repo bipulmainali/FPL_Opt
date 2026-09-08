@@ -10,17 +10,16 @@ CSV_FILE = "automatic_corridor_times.csv"
 
 # Page Layout
 st.set_page_config(
-    page_title="Auto-Segmented Corridor Travel Time & Map Tracker", layout="wide"
+    page_title="Auto-Segmented Corridor Travel Time Tracker", layout="wide"
 )
 
-st.title("🚗 Auto-Segmented Corridor Travel Time & Live Map Tracker")
+st.title("🚗 Auto-Segmented Corridor Travel Time & Strict Route Viewer")
 st.markdown(
-    "Automated traffic logging with micro-segment anti-detour protection and"
-    " side-by-side live maps."
+    "Automated traffic logging with micro-segment anti-detour protection."
 )
 
 
-# Helper function to query a route, auto-break it into micro-segments, and sum travel times
+# Helper function to query route, auto-break into micro-segments, and sum travel times
 def fetch_segmented_travel_time(api_key, origin, destination):
   url = "https://maps.googleapis.com/maps/api/directions/json"
   params = {
@@ -35,7 +34,7 @@ def fetch_segmented_travel_time(api_key, origin, destination):
     response = requests.get(url, params=params)
     data = response.json()
     if data.get("status") != "OK":
-      return None
+      return None, []
 
     steps = data["routes"][0]["legs"][0]["steps"]
     micro_waypoints = []
@@ -71,12 +70,21 @@ def fetch_segmented_travel_time(api_key, origin, destination):
           total_duration += leg["duration_in_traffic"]["value"]
         else:
           total_duration += leg["duration"]["value"]
-      return round(total_duration / 60)
+      return round(total_duration / 60), micro_waypoints
 
   except Exception as e:
     print(f"API Error: {e}")
 
-  return None
+  return None, []
+
+
+# Function to generate a strict Google Maps web URL with waypoints embedded
+def generate_strict_maps_url(origin, destination, waypoints):
+  # Format: https://www.google.com/maps/dir/Origin/Waypoint1/Waypoint2/Destination
+  base = "https://www.google.com/maps/dir"
+  parts = [origin] + waypoints + [destination]
+  clean_parts = [p.replace(" ", "+") for p in parts]
+  return f"{base}/" + "/".join(clean_parts)
 
 
 # Sidebar Setup
@@ -128,8 +136,12 @@ if not os.path.exists(CSV_FILE):
 def background_logger():
   while st.session_state.get("is_running", False):
     if api_key:
-      time_1 = fetch_segmented_travel_time(api_key, dir1_origin, dir1_destination)
-      time_2 = fetch_segmented_travel_time(api_key, dir2_origin, dir2_destination)
+      time_1, _ = fetch_segmented_travel_time(
+          api_key, dir1_origin, dir1_destination
+      )
+      time_2, _ = fetch_segmented_travel_time(
+          api_key, dir2_origin, dir2_destination
+      )
 
       if time_1 is not None and time_2 is not None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,7 +159,7 @@ if "is_running" not in st.session_state:
 
 # Main Layout Tabs
 tab_tracker, tab_maps = st.tabs(
-    ["📝 Automation & Data Table", "🗺️ Side-by-Side Live Maps"]
+    ["📝 Automation & Data Table", "🗺️ Strict Route Map Links"]
 )
 
 with tab_tracker:
@@ -165,10 +177,10 @@ with tab_tracker:
         else:
           st.session_state.is_running = True
 
-          t1 = fetch_segmented_travel_time(
+          t1, _ = fetch_segmented_travel_time(
               api_key, dir1_origin, dir1_destination
           )
-          t2 = fetch_segmented_travel_time(
+          t2, _ = fetch_segmented_travel_time(
               api_key, dir2_origin, dir2_destination
           )
           if t1 and t2:
@@ -222,35 +234,46 @@ with tab_tracker:
             label="📥 Download Table as CSV",
             data=csv_data,
             file_name="corridor_travel_times.csv",
-            mime="text/csv",
+            mime="text/css",
         )
     else:
       st.write("No recorded entries yet. Click 'Start Automatic Recording'.")
 
 with tab_maps:
-  st.subheader("🗺️ Live Route Visualizer (Side-by-Side)")
-  if api_key:
-    map_col1, map_col2 = st.columns(2)
+  st.subheader("🗺️ Strict Corridor Map Links (Zero Detours)")
+  st.markdown(
+      "Because Google's embed maps drop waypoints and force detours, use the"
+      " buttons below to open your strict, anti-detour routes directly in"
+      " Google Maps tabs."
+  )
 
-    with map_col1:
-      st.markdown(f"**{label_dir1} Corridor**")
-      embed_url_1 = f"https://www.google.com/maps/embed/v1/directions?key={api_key}&origin={requests.utils.quote(dir1_origin)}&destination={requests.utils.quote(dir1_destination)}&mode=driving"
-      st.markdown(
-          f'<iframe width="100%" height="500" style="border:0"'
-          f' loading="lazy" allowfullscreen src="{embed_url_1}"></iframe>',
-          unsafe_allow_html=True,
-      )
+  # Calculate micro-waypoints for both directions to build strict links
+  _, wps1 = fetch_segmented_travel_time(api_key, dir1_origin, dir1_destination)
+  _, wps2 = fetch_segmented_travel_time(api_key, dir2_origin, dir2_destination)
 
-    with map_col2:
-      st.markdown(f"**{label_dir2} Corridor**")
-      embed_url_2 = f"https://www.google.com/maps/embed/v1/directions?key={api_key}&origin={requests.utils.quote(dir2_origin)}&destination={requests.utils.quote(dir2_destination)}&mode=driving"
-      st.markdown(
-          f'<iframe width="100%" height="500" style="border:0"'
-          f' loading="lazy" allowfullscreen src="{embed_url_2}"></iframe>',
-          unsafe_allow_html=True,
-      )
-  else:
-    st.warning(
-        "Please enter your Google Maps API Key in the sidebar to render the"
-        " side-by-side interactive maps."
+  strict_url_1 = generate_strict_maps_url(dir1_origin, dir1_destination, wps1)
+  strict_url_2 = generate_strict_maps_url(dir2_origin, dir2_destination, wps2)
+
+  map_col1, map_col2 = st.columns(2)
+
+  with map_col1:
+    st.markdown(f"**{label_dir1} Corridor**")
+    st.markdown(
+        f'<a href="{strict_url_1}" target="_blank"><button'
+        ' style="background-color:#4CAF50; color:white; padding:12px 24px;'
+        ' border:none; border-radius:4px; cursor:pointer; width:100%;'
+        ' font-weight:bold; font-size:16px;">🗺️ Open Strict '
+        f"{label_dir1} Map</button></a>",
+        unsafe_allow_html=True,
+    )
+
+  with map_col2:
+    st.markdown(f"**{label_dir2} Corridor**")
+    st.markdown(
+        f'<a href="{strict_url_2}" target="_blank"><button'
+        ' style="background-color:#2196F3; color:white; padding:12px 24px;'
+        ' border:none; border-radius:4px; cursor:pointer; width:100%;'
+        ' font-weight:bold; font-size:16px;">🗺️ Open Strict '
+        f"{label_dir2} Map</button></a>",
+        unsafe_allow_html=True,
     )
