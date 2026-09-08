@@ -24,7 +24,6 @@ st.markdown(
 # Helper function to extract start and end points from a Google Maps URL
 def extract_endpoints_from_url(url):
   try:
-    # Google Maps directions URLs typically look like: .../maps/dir/Origin/Destination/...
     if "/maps/dir/" in url:
       path_part = url.split("/maps/dir/")[1]
       parts = path_part.split("/")
@@ -162,7 +161,7 @@ with col_ctrl:
             ).to_csv(CSV_FILE, mode="a", header=False, index=False)
 
           threading.Thread(target=background_logger, daemon=True).start()
-          st.success("Automation started for new corridor! First row recorded.")
+          st.success("Automation started for corridor! First row recorded.")
           st.rerun()
   else:
     if st.button(
@@ -175,6 +174,20 @@ with col_ctrl:
     st.info(
         f"🟢 **Status:** Running. Checking traffic every {interval_mins} minutes."
     )
+
+  st.markdown("---")
+  # Clear Recordings Button
+  if st.button(
+      "🗑️ Clear All Recordings", type="secondary", use_container_width=True
+  ):
+    st.session_state.is_running = False  # Stops background runner if active
+    if os.path.exists(CSV_FILE):
+      os.remove(CSV_FILE)
+    # Re-initialize clean CSV file with current column names
+    df_init = pd.DataFrame(columns=["Timestamp", col_name_1, col_name_2])
+    df_init.to_csv(CSV_FILE, index=False)
+    st.success("Recording history cleared successfully!")
+    st.rerun()
 
 with col_table:
   st.subheader("📊 Live Data Table")
