@@ -10,21 +10,51 @@ CSV_FILE = "automatic_corridor_times.csv"
 
 # Page Layout
 st.set_page_config(
-    page_title="Auto-Segmented Corridor Travel Time Tracker", layout="wide"
+    page_title="Grid-Locked Corridor Travel Time Tracker", layout="wide"
 )
 
-st.title("🚗 Auto-Segmented Corridor Travel Time & Strict Route Viewer")
+st.title("🚗 Grid-Locked Corridor Travel Time Tracker")
 st.markdown(
-    "Automated traffic logging with micro-segment anti-detour protection."
+    "Strict corridor tracking using programmatically generated intersections"
+    " to prevent detours."
 )
 
 
-# Helper function to query route, auto-break into micro-segments, and sum travel times
-def fetch_segmented_travel_time(api_key, origin, destination):
+# Helper function to generate strict grid waypoints along a numbered corridor
+def generate_linden_waypoints(start_num, end_num, reverse=False):
+  waypoints = []
+  step = 15  # Drop a mandatory checkpoint every 15 blocks
+
+  if not reverse:
+    curr = start_num + step
+    while curr < end_num:
+      waypoints.append(f"Linden Blvd & {curr}th St, Queens, NY")
+      curr += step
+  else:
+    curr = start_num - step
+    while curr > end_num:
+      waypoints.append(f"Linden Blvd & {curr}th St, Queens, NY")
+      curr -= step
+
+  return waypoints
+
+
+# Function to query travel time with strict corridor enforcement
+def fetch_corridor_travel_time(
+    api_key, origin, destination, start_num, end_num, reverse=False
+):
   url = "https://maps.googleapis.com/maps/api/directions/json"
+
+  # Generate strict checkpoints strictly on Linden Blvd
+  raw_waypoints = generate_linden_waypoints(start_num, end_num, reverse)
+  formatted_waypoints = (
+      "|".join([f"via:{wp}" for wp in raw_waypoints]) if raw_waypoints else ""
+  )
+
   params = {
       "origin": origin,
       "destination": destination,
+      "waypoints": formatted_waypoints,
       "departure_time": "now",
       "mode": "driving",
       "key": api_key,
@@ -33,63 +63,24 @@ def fetch_segmented_travel_time(api_key, origin, destination):
   try:
     response = requests.get(url, params=params)
     data = response.json()
-    if data.get("status") != "OK":
-      return None, []
 
-    steps = data["routes"][0]["legs"][0]["steps"]
-    micro_waypoints = []
-    accumulated_distance = 0
-    for step in steps:
-      accumulated_distance += step["distance"]["value"]
-      if accumulated_distance >= 1500:  # Every ~1 mile to lock path
-        end_loc = step["end_location"]
-        micro_waypoints.append(f"{end_loc['lat']},{end_loc['lng']}")
-        accumulated_distance = 0
-
-    formatted_waypoints = (
-        "|".join([f"via:{wp}" for wp in micro_waypoints])
-        if micro_waypoints
-        else ""
-    )
-    chunk_params = {
-        "origin": origin,
-        "destination": destination,
-        "waypoints": formatted_waypoints,
-        "departure_time": "now",
-        "mode": "driving",
-        "key": api_key,
-    }
-
-    chunk_response = requests.get(url, params=chunk_params)
-    chunk_data = chunk_response.json()
-
-    if chunk_data.get("status") == "OK":
+    if data.get("status") == "OK":
       total_duration = 0
-      for leg in chunk_data["routes"][0]["legs"]:
+      for leg in data["routes"][0]["legs"]:
         if "duration_in_traffic" in leg:
           total_duration += leg["duration_in_traffic"]["value"]
         else:
           total_duration += leg["duration"]["value"]
-      return round(total_duration / 60), micro_waypoints
-
+      return round(total_duration / 60)
   except Exception as e:
     print(f"API Error: {e}")
 
-  return None, []
-
-
-# Function to generate a strict Google Maps web URL with waypoints embedded
-def generate_strict_maps_url(origin, destination, waypoints):
-  # Format: https://www.google.com/maps/dir/Origin/Waypoint1/Waypoint2/Destination
-  base = "https://www.google.com/maps/dir"
-  parts = [origin] + waypoints + [destination]
-  clean_parts = [p.replace(" ", "+") for p in parts]
-  return f"{base}/" + "/".join(clean_parts)
+  return None
 
 
 # Sidebar Setup
 with st.sidebar:
-  st.header("⚙️ Settings & Corridor Setup")
+  st.header("⚙️ Corridor Settings")
   api_key = st.text_input("Google Maps API Key", type="password")
 
   interval_mins = st.selectbox(
@@ -110,20 +101,24 @@ with st.sidebar:
   st.markdown("---")
   st.subheader(f"Direction 1 ({label_dir1})")
   dir1_origin = st.text_input(
-      "Dir 1 Start", value="Linden Blvd & 113th St, Queens, NY 11420"
+      "Dir 1 Start Intersection", value="Linden Blvd & 113th St, Queens, NY"
   )
-  dir1_destination = st.text_input(
-      "Dir 1 End", value="Linden Blvd & 235th St, Queens, NY 11411"
+  dir1_dest = st.text_input(
+      "Dir 1 End Intersection", value="Linden Blvd & 235th St, Queens, NY"
   )
+  dir1_start_num = st.number_input("Dir 1 Start Street Number", value=113)
+  dir1_end_num = st.number_input("Dir 1 End Street Number", value=235)
 
   st.markdown("---")
   st.subheader(f"Direction 2 ({label_dir2})")
   dir2_origin = st.text_input(
-      "Dir 2 Start", value="Linden Blvd & 235th St, Queens, NY 11411"
+      "Dir 2 Start Intersection", value="Linden Blvd & 235th St, Queens, NY"
   )
-  dir2_destination = st.text_input(
-      "Dir 2 End", value="Linden Blvd & 113th St, Queens, NY 11420"
+  dir2_dest = st.text_input(
+      "Dir 2 End Intersection", value="Linden Blvd & 113th St, Queens, NY"
   )
+  dir2_start_num = st.number_input("Dir 2 Start Street Number", value=235)
+  dir2_end_num = st.number_input("Dir 2 End Street Number", value=113)
 
 col_name_1 = f"{label_dir1} Time"
 col_name_2 = f"{label_dir2} Time"
@@ -136,11 +131,16 @@ if not os.path.exists(CSV_FILE):
 def background_logger():
   while st.session_state.get("is_running", False):
     if api_key:
-      time_1, _ = fetch_segmented_travel_time(
-          api_key, dir1_origin, dir1_destination
+      time_1 = fetch_corridor_travel_time(
+          api_key,
+          dir1_origin,
+          dir1_dest,
+          dir1_start_num,
+          dir1_end_num,
+          reverse=False,
       )
-      time_2, _ = fetch_segmented_travel_time(
-          api_key, dir2_origin, dir2_destination
+      time_2 = fetch_corridor_travel_time(
+          api_key, dir2_origin, dir2_dest, dir2_start_num, dir2_end_num, reverse=True
       )
 
       if time_1 is not None and time_2 is not None:
@@ -159,7 +159,7 @@ if "is_running" not in st.session_state:
 
 # Main Layout Tabs
 tab_tracker, tab_maps = st.tabs(
-    ["📝 Automation & Data Table", "🗺️ Strict Route Map Links"]
+    ["📝 Automation & Data Table", "🗺️ Strict Corridor Map Links"]
 )
 
 with tab_tracker:
@@ -177,11 +177,21 @@ with tab_tracker:
         else:
           st.session_state.is_running = True
 
-          t1, _ = fetch_segmented_travel_time(
-              api_key, dir1_origin, dir1_destination
+          t1 = fetch_corridor_travel_time(
+              api_key,
+              dir1_origin,
+              dir1_dest,
+              dir1_start_num,
+              dir1_end_num,
+              reverse=False,
           )
-          t2, _ = fetch_segmented_travel_time(
-              api_key, dir2_origin, dir2_destination
+          t2 = fetch_corridor_travel_time(
+              api_key,
+              dir2_origin,
+              dir2_dest,
+              dir2_start_num,
+              dir2_end_num,
+              reverse=True,
           )
           if t1 and t2:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -191,7 +201,7 @@ with tab_tracker:
             ).to_csv(CSV_FILE, mode="a", header=False, index=False)
 
           threading.Thread(target=background_logger, daemon=True).start()
-          st.success("Automation started with anti-detour protection!")
+          st.success("Automation started with 100% Linden Blvd grid lock!")
           st.rerun()
     else:
       if st.button(
@@ -234,46 +244,52 @@ with tab_tracker:
             label="📥 Download Table as CSV",
             data=csv_data,
             file_name="corridor_travel_times.csv",
-            mime="text/css",
+            mime="text/csv",
         )
     else:
       st.write("No recorded entries yet. Click 'Start Automatic Recording'.")
 
 with tab_maps:
-  st.subheader("🗺️ Strict Corridor Map Links (Zero Detours)")
+  st.subheader("🗺️ Verify Strict Route Links")
   st.markdown(
-      "Because Google's embed maps drop waypoints and force detours, use the"
-      " buttons below to open your strict, anti-detour routes directly in"
-      " Google Maps tabs."
+      "Click below to open your strict Linden Boulevard route in Google Maps"
+      " and verify that every waypoint stays precisely on the corridor:"
   )
 
-  # Calculate micro-waypoints for both directions to build strict links
-  _, wps1 = fetch_segmented_travel_time(api_key, dir1_origin, dir1_destination)
-  _, wps2 = fetch_segmented_travel_time(api_key, dir2_origin, dir2_destination)
 
-  strict_url_1 = generate_strict_maps_url(dir1_origin, dir1_destination, wps1)
-  strict_url_2 = generate_strict_maps_url(dir2_origin, dir2_destination, wps2)
+  # Generate web-friendly strict URL
+  def make_url(origin, dest, nums, rev):
+    wps = generate_linden_waypoints(nums[0], nums[1], rev)
+    parts = [origin] + wps + [dest]
+    return (
+        "https://www.google.com/maps/dir/"
+        + "/".join([p.replace(" ", "+") for p in parts])
+    )
 
-  map_col1, map_col2 = st.columns(2)
 
-  with map_col1:
-    st.markdown(f"**{label_dir1} Corridor**")
+  url_1 = make_url(
+      dir1_origin, dir1_dest, (dir1_start_num, dir1_end_num), False
+  )
+  url_2 = make_url(
+      dir2_origin, dir2_dest, (dir2_start_num, dir2_end_num), True
+  )
+
+  m1, m2 = st.columns(2)
+  with m1:
     st.markdown(
-        f'<a href="{strict_url_1}" target="_blank"><button'
+        f'<a href="{url_1}" target="_blank"><button'
         ' style="background-color:#4CAF50; color:white; padding:12px 24px;'
         ' border:none; border-radius:4px; cursor:pointer; width:100%;'
-        ' font-weight:bold; font-size:16px;">🗺️ Open Strict '
+        ' font-weight:bold;">🗺️ Open Strict '
         f"{label_dir1} Map</button></a>",
         unsafe_allow_html=True,
     )
-
-  with map_col2:
-    st.markdown(f"**{label_dir2} Corridor**")
+  with m2:
     st.markdown(
-        f'<a href="{strict_url_2}" target="_blank"><button'
+        f'<a href="{url_2}" target="_blank"><button'
         ' style="background-color:#2196F3; color:white; padding:12px 24px;'
         ' border:none; border-radius:4px; cursor:pointer; width:100%;'
-        ' font-weight:bold; font-size:16px;">🗺️ Open Strict '
+        ' font-weight:bold;">🗺️ Open Strict '
         f"{label_dir2} Map</button></a>",
         unsafe_allow_html=True,
     )
