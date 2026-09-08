@@ -10,21 +10,19 @@ CSV_FILE = "automatic_corridor_times.csv"
 
 # Page Layout
 st.set_page_config(
-    page_title="Auto-Segmented Corridor Travel Time Logger", layout="wide"
+    page_title="Auto-Segmented Corridor Travel Time & Map Tracker", layout="wide"
 )
 
-st.title("🚗 Auto-Segmented Corridor Travel Time Tracker")
+st.title("🚗 Auto-Segmented Corridor Travel Time & Live Map Tracker")
 st.markdown(
-    "Enter your Start and End locations. The app automatically splits the route"
-    " into micro-segments to completely eliminate detours."
+    "Automated traffic logging with micro-segment anti-detour protection and"
+    " side-by-side live maps."
 )
 
 
-# Helper function to query a route, auto-break it into micro-segments along the path, and sum the travel times
+# Helper function to query a route, auto-break it into micro-segments, and sum travel times
 def fetch_segmented_travel_time(api_key, origin, destination):
   url = "https://maps.googleapis.com/maps/api/directions/json"
-
-  # Step 1: Request the route to get its official geometry (polyline steps)
   params = {
       "origin": origin,
       "destination": destination,
@@ -36,31 +34,24 @@ def fetch_segmented_travel_time(api_key, origin, destination):
   try:
     response = requests.get(url, params=params)
     data = response.json()
-
     if data.get("status") != "OK":
       return None
 
-    # Extract all step end-locations from the route to use as micro-waypoints
     steps = data["routes"][0]["legs"][0]["steps"]
-    
-    # To avoid hitting API waypoint limits, we sample points roughly every 1 to 2 miles (or every few steps)
     micro_waypoints = []
     accumulated_distance = 0
     for step in steps:
-      accumulated_distance += step["distance"]["value"]  # in meters
-      # Add a waypoint roughly every 1,500 meters (~1 mile) to keep the path locked to the corridor
-      if accumulated_distance >= 1500:
+      accumulated_distance += step["distance"]["value"]
+      if accumulated_distance >= 1500:  # Every ~1 mile to lock path
         end_loc = step["end_location"]
         micro_waypoints.append(f"{end_loc['lat']},{end_loc['lng']}")
         accumulated_distance = 0
 
-    # Step 2: Query the route again using these micro-waypoints enforced with 'via:'
     formatted_waypoints = (
         "|".join([f"via:{wp}" for wp in micro_waypoints])
         if micro_waypoints
         else ""
     )
-
     chunk_params = {
         "origin": origin,
         "destination": destination,
@@ -80,10 +71,10 @@ def fetch_segmented_travel_time(api_key, origin, destination):
           total_duration += leg["duration_in_traffic"]["value"]
         else:
           total_duration += leg["duration"]["value"]
-      return round(total_duration / 60)  # Total Minutes
+      return round(total_duration / 60)
 
   except Exception as e:
-    print(f"API/Parsing Error: {e}")
+    print(f"API Error: {e}")
 
   return None
 
@@ -137,12 +128,8 @@ if not os.path.exists(CSV_FILE):
 def background_logger():
   while st.session_state.get("is_running", False):
     if api_key:
-      time_1 = fetch_segmented_travel_time(
-          api_key, dir1_origin, dir1_destination
-      )
-      time_2 = fetch_segmented_travel_time(
-          api_key, dir2_origin, dir2_destination
-      )
+      time_1 = fetch_segmented_travel_time(api_key, dir1_origin, dir1_destination)
+      time_2 = fetch_segmented_travel_time(api_key, dir2_origin, dir2_destination)
 
       if time_1 is not None and time_2 is not None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -158,76 +145,112 @@ def background_logger():
 if "is_running" not in st.session_state:
   st.session_state.is_running = False
 
-col_ctrl, col_table = st.columns([1, 2])
+# Main Layout Tabs
+tab_tracker, tab_maps = st.tabs(
+    ["📝 Automation & Data Table", "🗺️ Side-by-Side Live Maps"]
+)
 
-with col_ctrl:
-  st.subheader("🚀 Automation Control")
+with tab_tracker:
+  col_ctrl, col_table = st.columns([1, 2])
 
-  if not st.session_state.is_running:
-    if st.button(
-        "Start Automatic Recording", type="primary", use_container_width=True
-    ):
-      if not api_key:
-        st.error("Please enter your Google Maps API key in the sidebar.")
-      else:
-        st.session_state.is_running = True
+  with col_ctrl:
+    st.subheader("🚀 Automation Control")
 
-        t1 = fetch_segmented_travel_time(api_key, dir1_origin, dir1_destination)
-        t2 = fetch_segmented_travel_time(api_key, dir2_origin, dir2_destination)
-        if t1 and t2:
-          ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-          pd.DataFrame(
-              [[ts, f"{t1} mins", f"{t2} mins"]],
-              columns=["Timestamp", col_name_1, col_name_2],
-          ).to_csv(CSV_FILE, mode="a", header=False, index=False)
+    if not st.session_state.is_running:
+      if st.button(
+          "Start Automatic Recording", type="primary", use_container_width=True
+      ):
+        if not api_key:
+          st.error("Please enter your Google Maps API key in the sidebar.")
+        else:
+          st.session_state.is_running = True
 
-        threading.Thread(target=background_logger, daemon=True).start()
-        st.success(
-            "Automation started with auto-segmented anti-detour protection!"
-        )
+          t1 = fetch_segmented_travel_time(
+              api_key, dir1_origin, dir1_destination
+          )
+          t2 = fetch_segmented_travel_time(
+              api_key, dir2_origin, dir2_destination
+          )
+          if t1 and t2:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pd.DataFrame(
+                [[ts, f"{t1} mins", f"{t2} mins"]],
+                columns=["Timestamp", col_name_1, col_name_2],
+            ).to_csv(CSV_FILE, mode="a", header=False, index=False)
+
+          threading.Thread(target=background_logger, daemon=True).start()
+          st.success("Automation started with anti-detour protection!")
+          st.rerun()
+    else:
+      if st.button(
+          "Stop Automatic Recording", type="secondary", use_container_width=True
+      ):
+        st.session_state.is_running = False
+        st.warning("Automation stopped.")
         st.rerun()
-  else:
+
+      st.info(
+          f"🟢 **Status:** Running. Checking traffic every {interval_mins}"
+          " minutes."
+      )
+
+    st.markdown("---")
     if st.button(
-        "Stop Automatic Recording", type="secondary", use_container_width=True
+        "🗑️ Clear All Recordings", type="secondary", use_container_width=True
     ):
       st.session_state.is_running = False
-      st.warning("Automation stopped.")
+      if os.path.exists(CSV_FILE):
+        os.remove(CSV_FILE)
+      df_init = pd.DataFrame(columns=["Timestamp", col_name_1, col_name_2])
+      df_init.to_csv(CSV_FILE, index=False)
+      st.success("Recording history cleared successfully!")
       st.rerun()
 
-    st.info(
-        f"🟢 **Status:** Running (Auto-Segmented). Checking every"
-        f" {interval_mins} mins."
-    )
+  with col_table:
+    st.subheader("📊 Live Data Table")
 
-  st.markdown("---")
-  if st.button(
-      "🗑️ Clear All Recordings", type="secondary", use_container_width=True
-  ):
-    st.session_state.is_running = False
     if os.path.exists(CSV_FILE):
-      os.remove(CSV_FILE)
-    df_init = pd.DataFrame(columns=["Timestamp", col_name_1, col_name_2])
-    df_init.to_csv(CSV_FILE, index=False)
-    st.success("Recording history cleared successfully!")
-    st.rerun()
+      df = pd.read_csv(CSV_FILE)
+      if len(df.columns) == 3:
+        df.columns = ["Timestamp", col_name_1, col_name_2]
 
-with col_table:
-  st.subheader("📊 Live Data Table")
+      st.dataframe(df, use_container_width=True)
 
-  if os.path.exists(CSV_FILE):
-    df = pd.read_csv(CSV_FILE)
-    if len(df.columns) == 3:
-      df.columns = ["Timestamp", col_name_1, col_name_2]
+      if not df.empty:
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Download Table as CSV",
+            data=csv_data,
+            file_name="corridor_travel_times.csv",
+            mime="text/csv",
+        )
+    else:
+      st.write("No recorded entries yet. Click 'Start Automatic Recording'.")
 
-    st.dataframe(df, use_container_width=True)
+with tab_maps:
+  st.subheader("🗺️ Live Route Visualizer (Side-by-Side)")
+  if api_key:
+    map_col1, map_col2 = st.columns(2)
 
-    if not df.empty:
-      csv_data = df.to_csv(index=False).encode("utf-8")
-      st.download_button(
-          label="📥 Download Table as CSV",
-          data=csv_data,
-          file_name="corridor_travel_times.csv",
-          mime="text/csv",
+    with map_col1:
+      st.markdown(f"**{label_dir1} Corridor**")
+      embed_url_1 = f"https://www.google.com/maps/embed/v1/directions?key={api_key}&origin={requests.utils.quote(dir1_origin)}&destination={requests.utils.quote(dir1_destination)}&mode=driving"
+      st.markdown(
+          f'<iframe width="100%" height="500" style="border:0"'
+          f' loading="lazy" allowfullscreen src="{embed_url_1}"></iframe>',
+          unsafe_allow_html=True,
+      )
+
+    with map_col2:
+      st.markdown(f"**{label_dir2} Corridor**")
+      embed_url_2 = f"https://www.google.com/maps/embed/v1/directions?key={api_key}&origin={requests.utils.quote(dir2_origin)}&destination={requests.utils.quote(dir2_destination)}&mode=driving"
+      st.markdown(
+          f'<iframe width="100%" height="500" style="border:0"'
+          f' loading="lazy" allowfullscreen src="{embed_url_2}"></iframe>',
+          unsafe_allow_html=True,
       )
   else:
-    st.write("No recorded entries yet. Click 'Start Automatic Recording'.")
+    st.warning(
+        "Please enter your Google Maps API Key in the sidebar to render the"
+        " side-by-side interactive maps."
+    )
