@@ -182,6 +182,31 @@ def fixture_label(fixtures, team_id, start_gw, horizon, teams):
     return " · ".join(f"GW{gw}: {', '.join(names)}" for gw, names in by_gw.items())
 
 
+FDR_COLORS = {1: "#006400", 2: "#70AD47", 3: "#F2F2F2", 4: "#E57373", 5: "#8B0000"}
+FDR_TEXT_COLORS = {1: "#FFFFFF", 2: "#14210D", 3: "#333333", 4: "#321010", 5: "#FFFFFF"}
+
+def fixture_difficulty_table(squad, fixtures, start_gw, horizon, teams):
+    """Build one row per squad player and scheduled fixture for color-coded FDR display."""
+    rows = []
+    if squad.empty:
+        return pd.DataFrame(columns=["Player", "Club", "GW", "Opponent", "Venue", "FDR"])
+    for _, player in squad.iterrows():
+        for fx in fixtures_for_team(fixtures, int(player.get("team_id", 0)), start_gw, horizon, teams):
+            rows.append({
+                "Player": player.get("name", ""), "Club": player.get("team", ""),
+                "GW": fx["gw"], "Opponent": fx["opponent"],
+                "Venue": "Home" if fx["venue"] == "H" else "Away", "FDR": int(fx["fdr"]),
+            })
+    return pd.DataFrame(rows, columns=["Player", "Club", "GW", "Opponent", "Venue", "FDR"])
+
+def style_fdr(value):
+    try:
+        rating = max(1, min(5, int(value)))
+    except (TypeError, ValueError):
+        return ""
+    return f"background-color: {FDR_COLORS[rating]}; color: {FDR_TEXT_COLORS[rating]}; font-weight: 700; text-align: center"
+
+
 def availability_multiplier(row) -> float:
     status = str(row.get("status", ""))
     chance = row.get("chance")
@@ -415,11 +440,31 @@ def rank_captains(xi: pd.DataFrame, projection_col: str):
     return xi.sort_values(projection_col, ascending=False).head(3).copy()
 
 
+def ensure_player_ids(frame: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with numeric FPL player IDs, recovering by name if needed."""
+    out = frame.copy()
+    if "id" in out.columns:
+        out["id"] = pd.to_numeric(out["id"], errors="coerce")
+    else:
+        out["id"] = pd.NA
+    if out["id"].isna().any() and "name" in out.columns and "id" in players.columns:
+        name_to_id = players.drop_duplicates("name").set_index("name")["id"].to_dict()
+        missing = out["id"].isna()
+        out.loc[missing, "id"] = out.loc[missing, "name"].map(name_to_id)
+    out = out[out["id"].notna()].copy()
+    out["id"] = out["id"].astype(int)
+    return out
+
+
 def transfer_shortlist(squad, players, budget_tenths, free_transfers, hit_cost, projection_col, max_results=15):
     """Enumerate legal one-for-one swaps; show projected gain and hit-aware gain."""
     if squad.empty:
         return pd.DataFrame()
-    current_ids = set(int(x) for x in squad["id"])
+    squad = ensure_player_ids(squad, players)
+    players = ensure_player_ids(players, players)
+    if squad.empty or "id" not in squad.columns:
+        return pd.DataFrame()
+    current_ids = set(squad["id"].astype(int))
     current_score = float(squad[projection_col].sum())
     current_cost = int(squad["price"].sum())
     # Candidate replacement pool limited to best projections by position to keep calculations quick.
@@ -590,6 +635,16 @@ try:
                 "is_captain":"Captain", "is_vice_captain":"Vice-captain"
             })
             st.dataframe(team_view, use_container_width=True, hide_index=True)
+            st.subheader("Fixture difficulty rating (FDR)")
+            st.caption("Easier fixtures are dark green; FDR 3 is neutral grey-white; harder fixtures are dark red.")
+            fdr_view = fixture_difficulty_table(squad, fixtures, selected_gw, int(horizon), team_map)
+            if fdr_view.empty:
+                st.info("No scheduled fixtures found for this horizon.")
+            else:
+                st.dataframe(
+                    fdr_view.style.map(style_fdr, subset=["FDR"]),
+                    use_container_width=True, hide_index=True,
+                )
             if len(squad) != 15:
                 st.warning(f"Expected 15 picks, found {len(squad)}. Optimization and chip comparisons may be incomplete.")
             st.subheader("Team structure and risk")
@@ -633,8 +688,24 @@ try:
         if opt_squad is not None:
             st.success(f"Legal squad found · projected score proxy {opt_squad[opt_col_saved].sum():.1f} over the selected horizon.")
             opt_show = opt_squad.copy()
+            current_ids = set(pd.to_numeric(squad.get("id", pd.Series(dtype=float)), errors="coerce").dropna().astype(int))
+            # Fall back to names for any legacy/stale squad frame missing player IDs.
+            if not current_ids and not squad.empty and "name" in squad.columns:
+                current_names = set(squad["name"].astype(str))
+            else:
+                current_names = set()
+            if "id" in opt_show.columns and current_ids:
+                opt_show["Squad status"] = opt_show["id"].astype(int).apply(
+                    lambda pid: "✅ In your squad" if pid in current_ids else "🔁 Potential transfer"
+                )
+            else:
+                current_names = current_names or set(squad.get("name", pd.Series(dtype=str)).astype(str))
+                opt_show["Squad status"] = opt_show["name"].astype(str).apply(
+                    lambda name: "✅ In your squad" if name in current_names else "🔁 Potential transfer"
+                )
             opt_show["Price"] = opt_show["price"].map(money)
-            st.dataframe(opt_show[["name", "position", "team", "Price", opt_col_saved, "availability", "fixture_run"]].rename(columns={
+            display_cols = ["Squad status", "name", "position", "team", "Price", opt_col_saved, "availability", "fixture_run"]
+            st.dataframe(opt_show[display_cols].rename(columns={
                 "name":"Player", "position":"Pos", "team":"Club", opt_col_saved:"Projection", "availability":"Availability", "fixture_run":"Fixtures"
             }), use_container_width=True, hide_index=True)
             xi, xi_score = best_starting_xi(opt_squad, opt_col_saved)
