@@ -456,8 +456,8 @@ def ensure_player_ids(frame: pd.DataFrame, players: pd.DataFrame) -> pd.DataFram
     return out
 
 
-def transfer_shortlist(squad, players, budget_tenths, free_transfers, hit_cost, projection_col, max_results=15):
-    """Enumerate legal one-for-one swaps; show projected gain and hit-aware gain."""
+def transfer_shortlist(squad, players, budget_tenths, free_transfers, hit_cost, projection_col, max_results=1):
+    """Recommend up to N distinct, budget-feasible one-for-one swaps."""
     if squad.empty:
         return pd.DataFrame()
     squad = ensure_player_ids(squad, players)
@@ -495,13 +495,39 @@ def transfer_shortlist(squad, players, budget_tenths, free_transfers, hit_cost, 
                 "Gain after hit": round(gain - hit, 2),
                 "New fixtures": incoming.get("fixture_run", ""),
                 "_gain": gain, "_out_id": int(out["id"]), "_in_id": int(incoming["id"]),
+                "_net_tenths": net,
             })
     if not rows:
         return pd.DataFrame()
-    result = pd.DataFrame(rows).sort_values(["Gain after hit", "Projection gain"], ascending=False)
-    # Avoid proposing multiple alternatives for the same outgoing player.
-    result = result.drop_duplicates(subset=["Out"], keep="first").head(max_results)
-    return result.drop(columns=["_gain", "_out_id", "_in_id"], errors="ignore")
+
+    # Pick transfers one by one, re-ranking with the hit that would apply at
+    # that position. Never recommend selling the same player twice or buying
+    # the same player twice. Enforce the combined net spend against the bank.
+    candidates = pd.DataFrame(rows)
+    selected = []
+    used_out, used_in = set(), set()
+    remaining_bank = int(budget_tenths)
+    for transfer_number in range(1, max(1, int(max_results)) + 1):
+        hit = int(hit_cost) if transfer_number > int(free_transfers) else 0
+        options = candidates.copy()
+        options = options[~options["_out_id"].isin(used_out) & ~options["_in_id"].isin(used_in)]
+        options = options[options["_net_tenths"] <= remaining_bank]
+        if options.empty:
+            break
+        options["_rank_score"] = options["_gain"] - hit
+        options = options.sort_values(["_rank_score", "_gain"], ascending=False)
+        choice = options.iloc[0].copy()
+        choice["Hit cost"] = hit
+        choice["Gain after hit"] = round(float(choice["_gain"]) - hit, 2)
+        selected.append(choice)
+        used_out.add(int(choice["_out_id"]))
+        used_in.add(int(choice["_in_id"]))
+        remaining_bank -= int(choice["_net_tenths"])
+        candidates = candidates[~candidates["_out_id"].isin(used_out) & ~candidates["_in_id"].isin(used_in)]
+    if not selected:
+        return pd.DataFrame()
+    result = pd.DataFrame(selected)
+    return result.drop(columns=["_gain", "_out_id", "_in_id", "_net_tenths", "_rank_score"], errors="ignore")
 
 
 def chip_assessment(squad, optimized, fixtures, teams, start_gw, horizon, projection_col):
@@ -668,12 +694,15 @@ try:
                 }), use_container_width=True, hide_index=True)
 
         st.markdown("**Transfer recommendations**")
+        transfer_count = st.slider("How many transfers are you considering?", min_value=1, max_value=5, value=1, step=1, key="transfer_count")
+        st.caption("Recommendations use different outgoing and incoming players. Extra transfers beyond the assumed free transfer include a 4-point hit each; combined spending is checked against your bank.")
         if bank_tenths is None:
             st.warning("Transfer shortlist needs your bank balance, which the public API did not return. Check the bank in FPL and try again later; the app won't guess it.")
         elif st.button("Get transfer recommendations", type="primary"):
-            with st.spinner("Checking legal one-for-one transfers against your budget…"):
-                recs = transfer_shortlist(squad, projected, int(bank_tenths), int(free_transfers), int(hit_cost), projection_col)
+            with st.spinner("Finding distinct, budget-feasible transfers…"):
+                recs = transfer_shortlist(squad, projected, int(bank_tenths), int(free_transfers), int(hit_cost), projection_col, max_results=int(transfer_count))
                 st.session_state["transfer_recs"] = recs
+                st.session_state["transfer_recs_count"] = int(transfer_count)
         recs = st.session_state.get("transfer_recs")
         if recs is not None:
             if recs.empty:
@@ -683,8 +712,8 @@ try:
                 if useful.empty:
                     st.info("No shortlisted transfer has a positive projected gain after the assumed hit cost.")
                 else:
-                    st.dataframe(useful.head(8), use_container_width=True, hide_index=True)
-                    st.caption("Heuristic estimates, not guarantees. Assumes one free transfer; verify your actual free transfers, selling prices, injuries and press conferences before the deadline.")
+                    st.dataframe(useful, use_container_width=True, hide_index=True)
+                    st.caption("Heuristic estimates, not guarantees. Assumes 1 free transfer because the public API does not reliably expose your live count. The shortlist avoids repeating outgoing or incoming players and checks combined budget.")
 
         st.markdown("**Chip recommendation**")
         used = {str(ch.get("name", "")).lower() for ch in chips if isinstance(ch, dict)}
