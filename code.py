@@ -172,14 +172,22 @@ def fixtures_for_team(fixtures, team_id: int, start_gw: int, horizon: int, teams
     return sorted(out, key=lambda x: (x["gw"], x["venue"]))
 
 
+def team_short_name(team_name, teams):
+    for team in teams.values():
+        if team.get("name") == team_name:
+            return team.get("short_name") or team_name[:3].upper()
+    return str(team_name)[:3].upper()
+
+
 def fixture_label(fixtures, team_id, start_gw, horizon, teams):
     fs = fixtures_for_team(fixtures, int(team_id), start_gw, horizon, teams)
     if not fs:
-        return "No scheduled fixture"
+        return "—"
     by_gw = {}
     for f in fs:
-        by_gw.setdefault(f["gw"], []).append(f"{f['opponent']} ({f['venue']}, FDR {f['fdr']})")
-    return " · ".join(f"GW{gw}: {', '.join(names)}" for gw, names in by_gw.items())
+        abbr = team_short_name(f['opponent'], teams)
+        by_gw.setdefault(f["gw"], []).append(f"{abbr} ({f['venue']}) · {f['fdr']}")
+    return " | ".join(f"GW{gw}: {', '.join(names)}" for gw, names in by_gw.items())
 
 
 FDR_COLORS = {1: "#006400", 2: "#70AD47", 3: "#F2F2F2", 4: "#E57373", 5: "#8B0000"}
@@ -263,6 +271,16 @@ def add_projections(players, fixtures, start_gw, horizon, teams):
     df["fixture_run"] = df.apply(
         lambda r: fixture_label(fixtures, r["team_id"], start_gw, horizon, teams), axis=1
     )
+    # Three compact, individually colorable fixture cells for transfer candidates.
+    for slot in range(3):
+        def fixture_slot(row, slot=slot):
+            fs = fixtures_for_team(fixtures, int(row.get("team_id", 0)), start_gw, slot + 1, teams)
+            fs = [fx for fx in fs if fx["gw"] >= start_gw]
+            if len(fs) <= slot:
+                return "—"
+            fx = fs[slot]
+            return f"{team_short_name(fx['opponent'], teams)} ({fx['venue']}) · {fx['fdr']}"
+        df[f"F{slot + 1}"] = df.apply(fixture_slot, axis=1)
     df["availability"] = df.apply(availability_label, axis=1)
     df["value_per_m"] = df.apply(
         lambda r: round(r["xP_horizon"] / max(0.1, r["price"] / 10), 2), axis=1
@@ -493,7 +511,8 @@ def transfer_shortlist(squad, players, budget_tenths, free_transfers, hit_cost, 
                 "Net spend": money(max(0, net)), "Bank change": money(-net),
                 "Projection gain": round(gain, 2), "Hit cost": hit,
                 "Gain after hit": round(gain - hit, 2),
-                "New fixtures": incoming.get("fixture_run", ""),
+                "F1": incoming.get("F1", "—"), "F2": incoming.get("F2", "—"),
+                "F3": incoming.get("F3", "—"),
                 "_gain": gain, "_out_id": int(out["id"]), "_in_id": int(incoming["id"]),
                 "_net_tenths": net,
             })
@@ -649,7 +668,7 @@ try:
         team_view["Price"] = team_view["price"].map(money)
         team_view["Sell price"] = team_view["selling_price"].map(money)
         # One fixture column per gameweek keeps the FDR colors inside the squad table.
-        fixture_gws = list(range(int(selected_gw), int(selected_gw) + int(horizon)))
+        fixture_gws = list(range(int(selected_gw), int(selected_gw) + 3))
         for gw in fixture_gws:
             labels, ratings = [], []
             for _, player in team_view.iterrows():
@@ -658,7 +677,7 @@ try:
                     labels.append("—")
                     ratings.append(None)
                 else:
-                    labels.append(" / ".join(f"{fx['opponent']} ({fx['venue']}) · {fx['fdr']}" for fx in fs))
+                    labels.append(" / ".join(f"{team_short_name(fx['opponent'], team_map)} ({fx['venue']}) · {fx['fdr']}" for fx in fs))
                     ratings.append(round(sum(fx["fdr"] for fx in fs) / len(fs)))
             team_view[f"GW{gw} fixture"] = labels
         show_cols = ["pick_position", "name", "position", "team", "Price", "Sell price", "xP_next", "availability"] + [f"GW{gw} fixture" for gw in fixture_gws] + ["is_captain", "is_vice_captain"]
@@ -676,7 +695,7 @@ try:
             rating = round(sum(int(x) for x in found) / len(found))
             return style_fdr(rating)
         fixture_cols = [f"GW{gw} fixture" for gw in fixture_gws if f"GW{gw} fixture" in display.columns]
-        st.dataframe(display.style.map(fixture_cell_style, subset=fixture_cols), use_container_width=True, hide_index=True)
+        st.dataframe(display.style.map(fixture_cell_style, subset=fixture_cols), use_container_width=True, hide_index=True, height="content")
 
         # Recommendations are consolidated here; no separate optimizer/chip/player tabs.
         st.subheader("Recommendations")
@@ -691,10 +710,12 @@ try:
             with st.expander("Why these captain picks?"):
                 st.dataframe(captains[["name", "team", "position", projection_col, "availability", "fixture_run"]].rename(columns={
                     "name":"Player", "team":"Club", "position":"Pos", projection_col:"Projection", "availability":"Availability", "fixture_run":"Fixture run"
-                }), use_container_width=True, hide_index=True)
+                }), use_container_width=True, hide_index=True, height="content")
 
         st.markdown("**Transfer recommendations**")
-        transfer_count = st.slider("How many transfers are you considering?", min_value=1, max_value=5, value=1, step=1, key="transfer_count")
+        slider_col, _ = st.columns([1, 3])
+        with slider_col:
+            transfer_count = st.slider("Transfers", min_value=1, max_value=5, value=1, step=1, key="transfer_count")
         st.caption("Recommendations use different outgoing and incoming players. Extra transfers beyond the assumed free transfer include a 4-point hit each; combined spending is checked against your bank.")
         if bank_tenths is None:
             st.warning("Transfer shortlist needs your bank balance, which the public API did not return. Check the bank in FPL and try again later; the app won't guess it.")
@@ -712,8 +733,15 @@ try:
                 if useful.empty:
                     st.info("No shortlisted transfer has a positive projected gain after the assumed hit cost.")
                 else:
-                    st.dataframe(useful, use_container_width=True, hide_index=True)
-                    st.caption("Heuristic estimates, not guarantees. Assumes 1 free transfer because the public API does not reliably expose your live count. The shortlist avoids repeating outgoing or incoming players and checks combined budget.")
+                    transfer_cols = ["Out", "In", "Pos", "Buy price", "Net spend", "F1", "F2", "F3", "Projection gain", "Hit cost", "Gain after hit"]
+                    transfer_cols = [col for col in transfer_cols if col in useful.columns]
+                    def transfer_fixture_style(value):
+                        import re
+                        match = re.search(r"·\s*([1-5])", str(value))
+                        return style_fdr(int(match.group(1))) if match else ""
+                    fixture_transfer_cols = [col for col in ["F1", "F2", "F3"] if col in useful.columns]
+                    st.dataframe(useful[transfer_cols].style.map(transfer_fixture_style, subset=fixture_transfer_cols), use_container_width=True, hide_index=True, height="content")
+                    st.caption("F1–F3 show the next three fixtures for each incoming player; colors indicate FDR. Heuristic estimates, not guarantees. Assumes 1 free transfer and checks distinct players and combined budget.")
 
         st.markdown("**Chip recommendation**")
         used = {str(ch.get("name", "")).lower() for ch in chips if isinstance(ch, dict)}
