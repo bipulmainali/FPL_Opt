@@ -540,7 +540,7 @@ def chip_assessment(squad, optimized, fixtures, teams, start_gw, horizon, projec
 # ----------------------------- UI -------------------------------------------
 
 st.title("⚽ FPL Team Advisor")
-st.caption("Live public FPL data · squad optimization · transfer planning · chip decision support")
+st.caption("Live public FPL data · current squad · transfer, captain and chip recommendations")
 
 with st.sidebar:
     st.header("Manager & planning")
@@ -600,275 +600,117 @@ try:
         except (requests.RequestException, RuntimeError, KeyError) as exc:
             st.error(f"Could not load team data: {exc}")
 
-    # Data available without manager ID.
-    tab_team, tab_optimizer, tab_transfers, tab_chips, tab_players, tab_history = st.tabs([
-        "My Team", "Squad Optimizer", "Transfers", "Chips", "Player Browser", "History"
-    ])
-
-    with tab_team:
-        if squad.empty:
-            st.info("Your FPL squad will load automatically for team ID 533979. If loading fails, check that the team is public and the FPL API is available.")
+    # Simple single-page dashboard: current squad + actionable recommendations.
+    st.divider()
+    if squad.empty:
+        st.info("Your FPL squad could not be loaded. Check that team ID 533979 is correct, public, and the FPL API is available.")
+    else:
+        bank_tenths = bank_api
+        if bank_tenths is not None:
+            st.caption(f"Loaded {profile.get('name', 'your team')} · picks from GW{loaded_pick_gw} · Bank: {money(bank_tenths)}")
         else:
-            bank_tenths = bank_api
-            squad_cost = int(squad["price"].sum())
-            squad_value = squad_cost + bank_tenths if bank_tenths is not None else None
-            if bank_tenths is not None:
-                st.caption(f"Bank balance from public API: {money(bank_tenths)}. Confirm against the official FPL app if it differs.")
-            else:
-                st.warning("The public API did not expose your current bank balance. It is shown as unavailable rather than guessed.")
-            a, b, c, d = st.columns(4)
-            a.metric("Squad market cost", money(squad_cost))
-            b.metric("Bank", money(bank_tenths) if bank_tenths is not None else "Unavailable")
-            c.metric("Squad + bank", money(squad_value) if squad_value is not None else "Unavailable")
-            d.metric("Team value (API)", money(profile.get("last_deadline_value", 0)) if profile else "—")
-            st.subheader("Current squad")
-            team_view = squad.copy()
-            team_view["price_display"] = team_view["price"].map(money)
-            team_view["sell_display"] = team_view["selling_price"].map(money)
-            cols = ["pick_position", "name", "position", "team", "price_display", "sell_display",
-                    "xP_next", "xP_horizon", "availability", "fixture_run", "is_captain", "is_vice_captain"]
-            cols = [c for c in cols if c in team_view.columns]
-            team_view = team_view[cols].rename(columns={
-                "pick_position":"Pick", "name":"Player", "position":"Pos", "team":"Club",
-                "price_display":"Price", "sell_display":"Sell price", "xP_next":"xP next GW",
-                "xP_horizon":"xP horizon", "availability":"Availability", "fixture_run":"Fixtures",
-                "is_captain":"Captain", "is_vice_captain":"Vice-captain"
-            })
-            st.dataframe(team_view, use_container_width=True, hide_index=True)
-            st.subheader("Fixture difficulty rating (FDR)")
-            st.caption("Easier fixtures are dark green; FDR 3 is neutral grey-white; harder fixtures are dark red.")
-            fdr_view = fixture_difficulty_table(squad, fixtures, selected_gw, int(horizon), team_map)
-            if fdr_view.empty:
-                st.info("No scheduled fixtures found for this horizon.")
-            else:
-                st.dataframe(
-                    fdr_view.style.map(style_fdr, subset=["FDR"]),
-                    use_container_width=True, hide_index=True,
-                )
-            if len(squad) != 15:
-                st.warning(f"Expected 15 picks, found {len(squad)}. Optimization and chip comparisons may be incomplete.")
-            st.subheader("Team structure and risk")
-            risk_cols = st.columns(4)
-            risk_cols[0].metric("Flagged / doubtful", int((squad["availability"].isin(["Unavailable / flagged", "Doubtful", "Monitor"])).sum()))
-            risk_cols[1].metric("Horizon projection", round(float(squad["xP_horizon"].sum()), 1))
-            risk_cols[2].metric("Starters projection", round(float(squad.loc[squad["pick_position"] <= 11, "xP_horizon"].sum()), 1))
-            risk_cols[3].metric("Bench projection", round(float(squad.loc[squad["pick_position"] > 11, "xP_horizon"].sum()), 1))
-            with st.expander("Availability news"):
-                flagged = squad[squad["availability"] != "Likely available"]
-                if flagged.empty:
-                    st.write("No availability flags detected in the API data.")
+            st.caption(f"Loaded {profile.get('name', 'your team')} · picks from GW{loaded_pick_gw} · Bank balance unavailable from API")
+
+        a, b, c, d = st.columns(4)
+        a.metric("Squad players", len(squad))
+        b.metric("Bank", money(bank_tenths) if bank_tenths is not None else "Unavailable")
+        c.metric("Squad value", money(int(squad["price"].sum()) + (bank_tenths or 0)))
+        d.metric("Projected points", round(float(squad[projection_col].sum()), 1))
+
+        st.subheader("Current squad")
+        st.caption("Fixture cells are color-coded by FDR: dark green = easiest (1), grey-white = average (3), dark red = hardest (5).")
+        team_view = squad.copy()
+        team_view["Price"] = team_view["price"].map(money)
+        team_view["Sell price"] = team_view["selling_price"].map(money)
+        # One fixture column per gameweek keeps the FDR colors inside the squad table.
+        fixture_gws = list(range(int(selected_gw), int(selected_gw) + int(horizon)))
+        for gw in fixture_gws:
+            labels, ratings = [], []
+            for _, player in team_view.iterrows():
+                fs = [fx for fx in fixtures_for_team(fixtures, int(player["team_id"]), gw, 1, team_map) if fx["gw"] == gw]
+                if not fs:
+                    labels.append("—")
+                    ratings.append(None)
                 else:
-                    st.dataframe(flagged[["name", "team", "availability", "chance", "news"]], use_container_width=True, hide_index=True)
+                    labels.append(" / ".join(f"{fx['opponent']} ({fx['venue']}) · {fx['fdr']}" for fx in fs))
+                    ratings.append(round(sum(fx["fdr"] for fx in fs) / len(fs)))
+            team_view[f"GW{gw} fixture"] = labels
+        show_cols = ["pick_position", "name", "position", "team", "Price", "Sell price", "xP_next", "availability"] + [f"GW{gw} fixture" for gw in fixture_gws] + ["is_captain", "is_vice_captain"]
+        show_cols = [col for col in show_cols if col in team_view.columns]
+        display = team_view[show_cols].rename(columns={
+            "pick_position":"Pick", "name":"Player", "position":"Pos", "team":"Club",
+            "xP_next":"xP next GW", "availability":"Availability",
+            "is_captain":"C", "is_vice_captain":"VC"
+        })
+        def fixture_cell_style(value):
+            import re
+            found = re.findall(r"·\s*([1-5])", str(value))
+            if not found:
+                return ""
+            rating = round(sum(int(x) for x in found) / len(found))
+            return style_fdr(rating)
+        fixture_cols = [f"GW{gw} fixture" for gw in fixture_gws if f"GW{gw} fixture" in display.columns]
+        st.dataframe(display.style.map(fixture_cell_style, subset=fixture_cols), use_container_width=True, hide_index=True)
 
-    with tab_optimizer:
-        st.subheader("Optimize a legal 15-player squad")
-        if not SCIPY_AVAILABLE:
-            st.error("The full optimizer requires scipy. Install it with: pip install scipy")
-        # Automatically use current squad market cost + API bank when available.
-        # If bank is unavailable, avoid inventing cash: optimize within current squad cost.
-        if not squad.empty:
-            budget_tenths = int(squad["price"].sum()) + (int(bank_api) if bank_api is not None else 0)
-            if bank_api is None:
-                st.warning("Bank balance was not available from the API; optimizer budget is conservatively set to the current squad market cost.")
-        else:
-            budget_tenths = 1000
-            st.caption("No team loaded: optimizer uses a default £100.0m budget.")
-        optimizer_scope = st.radio("Optimize for", ["Next gameweek", f"Next {horizon} gameweeks"], horizontal=True)
-        opt_col = "xP_next" if optimizer_scope == "Next gameweek" else "xP_horizon"
-        if st.button("Find best legal squad", type="primary"):
-            with st.spinner("Optimizing squad under FPL rules…"):
-                opt_squad, opt_error = optimize_squad_milp(projected, budget_tenths, opt_col)
-            if opt_error:
-                st.error(opt_error)
-            else:
-                st.session_state["optimized_squad"] = opt_squad
-                st.session_state["optimized_projection_col"] = opt_col
-        opt_squad = st.session_state.get("optimized_squad")
-        opt_col_saved = st.session_state.get("optimized_projection_col", opt_col)
-        if opt_squad is not None:
-            st.success(f"Legal squad found · projected score proxy {opt_squad[opt_col_saved].sum():.1f} over the selected horizon.")
-            opt_show = opt_squad.copy()
-            current_ids = set(pd.to_numeric(squad.get("id", pd.Series(dtype=float)), errors="coerce").dropna().astype(int))
-            # Fall back to names for any legacy/stale squad frame missing player IDs.
-            if not current_ids and not squad.empty and "name" in squad.columns:
-                current_names = set(squad["name"].astype(str))
-            else:
-                current_names = set()
-            if "id" in opt_show.columns and current_ids:
-                opt_show["Squad status"] = opt_show["id"].astype(int).apply(
-                    lambda pid: "✅ In your squad" if pid in current_ids else "🔁 Potential transfer"
-                )
-            else:
-                current_names = current_names or set(squad.get("name", pd.Series(dtype=str)).astype(str))
-                opt_show["Squad status"] = opt_show["name"].astype(str).apply(
-                    lambda name: "✅ In your squad" if name in current_names else "🔁 Potential transfer"
-                )
-            opt_show["Price"] = opt_show["price"].map(money)
-            display_cols = ["Squad status", "name", "position", "team", "Price", opt_col_saved, "availability", "fixture_run"]
-            st.dataframe(opt_show[display_cols].rename(columns={
-                "name":"Player", "position":"Pos", "team":"Club", opt_col_saved:"Projection", "availability":"Availability", "fixture_run":"Fixtures"
-            }), use_container_width=True, hide_index=True)
-            xi, xi_score = best_starting_xi(opt_squad, opt_col_saved)
-            if xi is not None:
-                st.markdown("#### Best starting XI and captain")
-                xi = xi.sort_values("position", key=lambda s: s.map({"GK":0,"DEF":1,"MID":2,"FWD":3}))
-                st.dataframe(xi[["name", "position", "team", opt_col_saved, "availability"]].rename(columns={
-                    "name":"Player", "position":"Pos", "team":"Club", opt_col_saved:"Projection", "availability":"Availability"
+        # Recommendations are consolidated here; no separate optimizer/chip/player tabs.
+        st.subheader("Recommendations")
+        xi, xi_score = best_starting_xi(squad, projection_col)
+        if xi is not None and not xi.empty:
+            captains = rank_captains(xi, projection_col)
+            best = captains.iloc[0]
+            vice = captains.iloc[1] if len(captains) > 1 else captains.iloc[0]
+            cap1, cap2 = st.columns(2)
+            cap1.metric("Captain", f"{best['name']} · {best['team']}", f"{float(best[projection_col]):.2f} projected pts")
+            cap2.metric("Vice-captain", f"{vice['name']} · {vice['team']}", f"{float(vice[projection_col]):.2f} projected pts")
+            with st.expander("Why these captain picks?"):
+                st.dataframe(captains[["name", "team", "position", projection_col, "availability", "fixture_run"]].rename(columns={
+                    "name":"Player", "team":"Club", "position":"Pos", projection_col:"Projection", "availability":"Availability", "fixture_run":"Fixture run"
                 }), use_container_width=True, hide_index=True)
-                cap = rank_captains(xi, opt_col_saved)
-                st.write("Captain candidates: " + " · ".join(f'{r["name"]} ({r[opt_col_saved]:.2f})' for _, r in cap.iterrows()))
-            if not squad.empty:
-                current_xi, current_score = best_starting_xi(squad, opt_col_saved)
-                if current_xi is not None and xi is not None:
-                    st.metric("Optimized XI advantage vs current XI", f"{xi_score - current_score:+.2f} projection points")
-        else:
-            st.caption("The optimizer uses binary integer programming and enforces 15 players, position quotas, budget and a maximum of three players per club.")
 
-    with tab_transfers:
-        st.subheader("Transfer recommendations")
-        if squad.empty:
-            st.info("Load your team to compare transfers against your current squad.")
-        else:
-            bank_tenths = bank_api
-            if bank_tenths is None:
-                st.warning("The API did not provide your bank balance, so transfer affordability cannot be calculated reliably. The shortlist is disabled rather than assuming a bank balance.")
-            if st.button("Calculate transfer shortlist", disabled=bank_tenths is None):
-                recs = transfer_shortlist(
-                    squad, projected, int(bank_tenths), int(free_transfers), int(hit_cost), projection_col
-                )
+        st.markdown("**Transfer recommendations**")
+        if bank_tenths is None:
+            st.warning("Transfer shortlist needs your bank balance, which the public API did not return. Check the bank in FPL and try again later; the app won't guess it.")
+        elif st.button("Get transfer recommendations", type="primary"):
+            with st.spinner("Checking legal one-for-one transfers against your budget…"):
+                recs = transfer_shortlist(squad, projected, int(bank_tenths), int(free_transfers), int(hit_cost), projection_col)
                 st.session_state["transfer_recs"] = recs
-            recs = st.session_state.get("transfer_recs")
-            if recs is not None:
-                if recs.empty:
-                    st.warning("No legal one-for-one transfer candidates found within the current budget.")
+        recs = st.session_state.get("transfer_recs")
+        if recs is not None:
+            if recs.empty:
+                st.info("No legal one-for-one transfer with a positive candidate gain was found in the current search.")
+            else:
+                useful = recs[recs["Gain after hit"] > 0].copy()
+                if useful.empty:
+                    st.info("No shortlisted transfer has a positive projected gain after the assumed hit cost.")
                 else:
-                    st.dataframe(recs, use_container_width=True, hide_index=True)
-                    st.caption("One-for-one legal swaps only. Net spend uses estimated selling prices. Projection gain is a heuristic; hit treatment is indicative and should be checked against your actual free-transfer rules.")
-            st.markdown("#### Transfer history")
-            if isinstance(transfers, list) and transfers:
-                tdf = pd.DataFrame(transfers)
-                if "time" in tdf:
-                    tdf["time"] = pd.to_datetime(tdf["time"], errors="coerce", utc=True)
-                st.dataframe(tdf, use_container_width=True, hide_index=True)
-            else:
-                st.write("No public transfer history returned.")
+                    st.dataframe(useful.head(8), use_container_width=True, hide_index=True)
+                    st.caption("Heuristic estimates, not guarantees. Assumes one free transfer; verify your actual free transfers, selling prices, injuries and press conferences before the deadline.")
 
-    with tab_chips:
-        st.subheader("Chip strategy")
-        if not squad.empty:
-            if chips:
-                chip_df = pd.DataFrame(chips)
-                st.markdown("**Chips recorded by FPL**")
-                st.dataframe(chip_df, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No chip history was returned by the API.")
-            st.markdown("**Chip assessment**")
-            st.write("Select a chip to view the relevant decision checklist.")
-            chip_choice = st.selectbox("Chip", ["Free Hit", "Wildcard", "Bench Boost", "Triple Captain"])
-            used_names = [str(c.get("name", "")).lower() for c in chips if isinstance(c, dict)]
-            chip_alias = {"Free Hit": "freehit", "Wildcard": "wildcard", "Bench Boost": "bboost", "Triple Captain": "3xc"}
-            is_used = any(chip_alias[chip_choice] in x for x in used_names)
-            if is_used:
-                st.warning(f"The public history suggests {chip_choice} has already been used. Confirm chip rules for this season.")
-            else:
-                if chip_choice == "Free Hit":
-                    st.write("Compare the best optimized XI with your current XI. Free Hit is most attractive when the one-week gain is substantial and the squad returns to normal afterward.")
-                elif chip_choice == "Wildcard":
-                    st.write("Use when multiple squad problems persist over several gameweeks. Compare the optimized multiweek squad against a small number of transfers and account for future flexibility.")
-                elif chip_choice == "Bench Boost":
-                    bench = squad[squad["pick_position"] > 11] if "pick_position" in squad else squad.iloc[11:]
-                    st.metric("Current bench projection", round(float(bench[projection_col].sum()), 2))
-                    st.write("Bench Boost is most attractive when all four bench players have strong minutes security and good fixtures, particularly in a double gameweek.")
-                else:
-                    xi, _ = best_starting_xi(squad, projection_col)
-                    if xi is not None:
-                        caps = rank_captains(xi, projection_col)
-                        st.dataframe(caps[["name", "team", projection_col, "availability", "fixture_run"]].rename(columns={
-                            "name":"Captain candidate", "team":"Club", projection_col:"Projection", "availability":"Availability", "fixture_run":"Fixtures"
-                        }), use_container_width=True, hide_index=True)
-                    st.write("Triple Captain usually has greater upside in a double gameweek with high expected minutes, but is not automatically optimal.")
-            st.markdown("#### Automated signal (heuristic)")
-            optimized = st.session_state.get("optimized_squad")
-            if optimized is not None:
-                for label, value in chip_assessment(squad, optimized, fixtures, team_map, selected_gw, horizon, projection_col):
-                    st.write(f"**{label}:** {value}")
-            else:
-                st.info("Run the Squad Optimizer first to compare your current team with an optimized Free Hit squad.")
+        st.markdown("**Chip recommendation**")
+        used = {str(ch.get("name", "")).lower() for ch in chips if isinstance(ch, dict)}
+        if any("freehit" in x for x in used):
+            freehit_status = "Free Hit appears used already; verify in the official FPL app."
         else:
-            st.info("Load your team to assess chip usage and chip value.")
-
-    with tab_players:
-        st.subheader("Player database")
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            pos_filter = st.multiselect("Position", ["GK", "DEF", "MID", "FWD"], default=["GK", "DEF", "MID", "FWD"], key="pos_filter")
-        with f2:
-            club_filter = st.multiselect("Club", sorted(projected["team"].unique()), key="club_filter")
-        with f3:
-            max_price = st.slider("Maximum price (£m)", 3.5, 15.5, 15.5, 0.1)
-        with f4:
-            min_minutes = st.number_input("Minimum minutes", 0, 4000, 0, 90)
-        min_projection = st.slider("Minimum horizon projection", 0.0, 50.0, 0.0, 0.5)
-        view = projected[
-            projected["position"].isin(pos_filter)
-            & (projected["price"] <= money_input_to_tenths(max_price))
-            & (projected["minutes"] >= min_minutes)
-            & (projected["xP_horizon"] >= min_projection)
-        ].copy()
-        if club_filter:
-            view = view[view["team"].isin(club_filter)]
-        view = view.sort_values("xP_horizon", ascending=False)
-        view["Price"] = view["price"].map(money)
-        cols = ["name", "team", "position", "Price", "form", "ppg", "points", "xP_next", "xP_horizon",
-                "value_per_m", "selected_by", "availability", "news", "fixture_run"]
-        st.dataframe(view[cols].rename(columns={
-            "name":"Player", "team":"Club", "position":"Pos", "form":"Form", "ppg":"Pts/G",
-            "points":"Total pts", "xP_next":"xP next GW", "xP_horizon":"xP horizon",
-            "value_per_m":"xP per £m", "selected_by":"Selected %", "availability":"Availability",
-            "news":"FPL news", "fixture_run":"Fixtures"
-        }), use_container_width=True, hide_index=True)
-
-    with tab_history:
-        st.subheader("Manager history")
-        if not profile:
-            st.info("Manager history will appear after team ID 533979 loads successfully.")
+            freehit_status = "Save Free Hit unless your starting XI has several unavailable players or a major blank-gameweek problem."
+        if any("bboost" in x for x in used):
+            bench_status = "Bench Boost appears used already; verify in the official FPL app."
         else:
-            h1, h2, h3 = st.columns(3)
-            h1.metric("Overall rank", f'{profile.get("summary_overall_rank"):,}' if profile.get("summary_overall_rank") else "—")
-            h2.metric("Overall points", f'{profile.get("summary_overall_points"):,}' if profile.get("summary_overall_points") is not None else "—")
-            h3.metric("Team value", money(profile.get("last_deadline_value", 0)))
-            current_hist = history.get("current", []) if history else []
-            if current_hist:
-                hdf = pd.DataFrame(current_hist)
-                keep = [c for c in ["event", "points", "total_points", "rank", "overall_rank", "event_transfers", "event_transfers_cost", "points_on_bench", "value", "bank"] if c in hdf]
-                st.dataframe(hdf[keep].rename(columns={
-                    "event":"GW", "points":"GW points", "total_points":"Total points", "rank":"GW rank",
-                    "overall_rank":"Overall rank", "event_transfers":"Transfers", "event_transfers_cost":"Hit",
-                    "points_on_bench":"Bench points", "value":"Team value (tenths)", "bank":"Bank (tenths)"
-                }), use_container_width=True, hide_index=True)
-                if "points" in hdf:
-                    st.line_chart(hdf.set_index("event")["points"])
-            past = history.get("past", []) if history else []
-            if past:
-                st.markdown("**Previous seasons**")
-                st.dataframe(pd.DataFrame(past), use_container_width=True, hide_index=True)
+            bench = squad[squad["pick_position"] > 11] if "pick_position" in squad else squad.iloc[11:]
+            bench_score = float(bench[projection_col].sum()) if not bench.empty else 0.0
+            bench_status = (f"Bench projection is {bench_score:.1f}; consider Bench Boost only when all four bench players are likely to play, ideally in a double gameweek." if bench_score >= 12 else f"Bench projection is {bench_score:.1f}; likely save Bench Boost for a stronger bench / double gameweek.")
+        if any("wildcard" in x for x in used):
+            wildcard_status = "Wildcard appears used already; verify in the official FPL app."
+        else:
+            flagged_count = int((squad["availability"] != "Likely available").sum())
+            wildcard_status = f"{flagged_count} squad player(s) have availability flags. Consider Wildcard only if several issues persist over multiple gameweeks, not just for one fixture swing."
+        if any("3xc" in x for x in used):
+            tc_status = "Triple Captain appears used already; verify in the official FPL app."
+        else:
+            tc_status = f"Captain is {best['name'] if xi is not None and not xi.empty else 'not available'}. Prefer Triple Captain in a double gameweek with high minutes security; otherwise save it."
+        st.write(f"- **Free Hit:** {freehit_status}")
+        st.write(f"- **Wildcard:** {wildcard_status}")
+        st.write(f"- **Bench Boost:** {bench_status}")
+        st.write(f"- **Triple Captain:** {tc_status}")
 
-    with st.expander("Model details and important limitations"):
-        st.markdown("""
-**Data source:** public endpoints at `https://fantasy.premierleague.com/api/`. This API is unofficial, undocumented by FPL, and can change or throttle requests.
-
-**Optimization constraints:** exactly 15 players; 2 goalkeepers, 5 defenders, 5 midfielders and 3 forwards; no more than 3 players from one club; total player cost must fit the budget. The best XI enumerator enforces a goalkeeper and legal 3–5 defenders, 2–5 midfielders and 1–3 forwards.
-
-**Projection method:** blends FPL's `ep_next`, points per game and recent form, then applies a modest fixture difficulty modifier across the chosen horizon. Availability flags reduce projections. These are heuristic projections, not calibrated probabilities.
-
-**Prices:** current prices are public. Selling prices are taken from the public picks payload if present, otherwise current price is used as a fallback. Price-rise profit rules and purchase history may therefore be imperfect.
-
-**Transfers:** the transfer shortlist evaluates legal one-for-one moves. It does not yet search every multi-transfer sequence or model price changes. Free transfers and points-hit inputs are editable because the API's public endpoints do not always expose the exact live account state.
-
-**Chips:** chip history is read from public manager history when available. The chip value assessment is a comparison/checklist, not a precise expected-value simulation. Check current season rules and official team news.
-
-**Privacy:** the app does not ask for your FPL password, cookies, or login credentials.
-        """)
 except requests.RequestException as exc:
-    st.error(f"Unable to reach the FPL API right now: {exc}")
-    st.info("Try again later. The public FPL API can occasionally rate-limit requests or be unavailable.")
+    st.error(f"Could not load FPL data: {exc}. Please refresh and try again.")
